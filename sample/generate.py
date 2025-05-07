@@ -7,6 +7,7 @@ from utils.fixseed import fixseed
 import os
 import numpy as np
 import torch
+import time # Added for timing
 from utils.parser_util import generate_args
 from utils.model_util import create_model_and_diffusion, load_saved_model
 from utils import dist_util
@@ -24,6 +25,14 @@ def main(args=None):
     if args is None:
         # args is None unless this method is called from another function (e.g. during training)
         args = generate_args()
+    
+    # Ensure no_video attribute exists, defaulting to False if not set by caller or argparser
+    if not hasattr(args, 'no_video'):
+        args.no_video = False
+
+    overall_start_time = time.time() # Start timer for main function
+    print(f"[{time.time() - overall_start_time:.2f}s] Starting MDM generate.py main function...")
+
     fixseed(args.seed)
     out_path = args.output_dir
     n_joints = 22 if args.dataset == 'humanml' else 21
@@ -76,11 +85,15 @@ def main(args=None):
     args.batch_size = args.num_samples  # Sampling a single batch from the testset, with exactly args.num_samples
 
     print('Loading dataset...')
+    data_load_start = time.time()
     data = load_dataset(args, max_frames, n_frames)
+    print(f"[{time.time() - overall_start_time:.2f}s] Dataset loaded (took {time.time() - data_load_start:.2f}s).")
     total_num_samples = args.num_samples * args.num_repetitions
 
     print("Creating model and diffusion...")
+    model_create_start = time.time()
     model, diffusion = create_model_and_diffusion(args, data)
+    print(f"[{time.time() - overall_start_time:.2f}s] Model and diffusion created (took {time.time() - model_create_start:.2f}s).")
 
     sample_fn = diffusion.p_sample_loop
     if args.autoregressive:
@@ -88,7 +101,9 @@ def main(args=None):
         sample_fn = sample_cls.sample
 
     print(f"Loading checkpoints from [{args.model_path}]...")
+    ckpt_load_start = time.time()
     load_saved_model(model, args.model_path, use_avg=args.use_ema)
+    print(f"[{time.time() - overall_start_time:.2f}s] Checkpoints loaded (took {time.time() - ckpt_load_start:.2f}s).")
 
     if args.guidance_param != 1:
         model = ClassifierFreeSampleModel(model)   # wrapping model with the classifier-free sampler
@@ -129,7 +144,10 @@ def main(args=None):
     
     if 'text' in model_kwargs['y'].keys():
         # encoding once instead of each iteration saves lots of time
+        print(f"[{time.time() - overall_start_time:.2f}s] Encoding text...")
+        text_encode_start = time.time()
         model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
+        print(f"[{time.time() - overall_start_time:.2f}s] Text encoded (took {time.time() - text_encode_start:.2f}s).")
     
     if args.dynamic_text_path != '':
         # Rearange the text to match the autoregressive sampling - each prompt fits to a single prediction
@@ -144,6 +162,7 @@ def main(args=None):
     for rep_i in range(args.num_repetitions):
         print(f'### Sampling [repetitions #{rep_i}]')
 
+        sampling_start_time = time.time()
         sample = sample_fn(
             model,
             motion_shape,
@@ -156,19 +175,26 @@ def main(args=None):
             noise=None,
             const_noise=False,
         )
+        print(f"[{time.time() - overall_start_time:.2f}s] Sampling for repetition #{rep_i} finished (took {time.time() - sampling_start_time:.2f}s).")
 
         # Recover XYZ *positions* from HumanML3D vector representation
         if model.data_rep == 'hml_vec':
+            print(f"[{time.time() - overall_start_time:.2f}s] Recovering from RIC...")
+            recover_start_time = time.time()
             n_joints = 22 if sample.shape[1] == 263 else 21
             sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
             sample = recover_from_ric(sample, n_joints)
             sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
+            print(f"[{time.time() - overall_start_time:.2f}s] Recovery from RIC finished (took {time.time() - recover_start_time:.2f}s).")
 
+        print(f"[{time.time() - overall_start_time:.2f}s] Converting to XYZ (model.rot2xyz)...")
+        rot2xyz_start_time = time.time()
         rot2xyz_pose_rep = 'xyz' if model.data_rep in ['xyz', 'hml_vec'] else model.data_rep
         rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(args.batch_size, n_frames).bool()
         sample = model.rot2xyz(x=sample, mask=rot2xyz_mask, pose_rep=rot2xyz_pose_rep, glob=True, translation=True,
                                jointstype='smpl', vertstrans=True, betas=None, beta=0, glob_rot=None,
                                get_rotations_back=False)
+        print(f"[{time.time() - overall_start_time:.2f}s] Conversion to XYZ finished (took {time.time() - rot2xyz_start_time:.2f}s).")
 
         if args.unconstrained:
             all_text += ['unconstrained'] * args.num_samples
@@ -195,7 +221,8 @@ def main(args=None):
     os.makedirs(out_path)
 
     npy_path = os.path.join(out_path, 'results.npy')
-    print(f"saving results file to [{npy_path}]")
+    print(f"[{time.time() - overall_start_time:.2f}s] Saving results file to [{npy_path}]...")
+    save_npy_start_time = time.time()
     np.save(npy_path,
             {'motion': all_motions, 'text': all_text, 'lengths': all_lengths,
              'num_samples': args.num_samples, 'num_repetitions': args.num_repetitions})
@@ -207,47 +234,60 @@ def main(args=None):
         fw.write(text_file_content)
     with open(npy_path.replace('.npy', '_len.txt'), 'w') as fw:
         fw.write('\n'.join([str(l) for l in all_lengths]))
+    print(f"[{time.time() - overall_start_time:.2f}s] Results files saved (took {time.time() - save_npy_start_time:.2f}s).")
 
-    print(f"saving visualizations to [{out_path}]...")
-    skeleton = paramUtil.kit_kinematic_chain if args.dataset == 'kit' else paramUtil.t2m_kinematic_chain
+    if not args.no_video:
+        print(f"[{time.time() - overall_start_time:.2f}s] Saving visualizations to [{out_path}]...")
+        vis_overall_start_time = time.time()
+        skeleton = paramUtil.kit_kinematic_chain if args.dataset == 'kit' else paramUtil.t2m_kinematic_chain
 
-    sample_print_template, row_print_template, all_print_template, \
-    sample_file_template, row_file_template, all_file_template = construct_template_variables(args.unconstrained)
-    max_vis_samples = 6
-    num_vis_samples = min(args.num_samples, max_vis_samples)
-    animations = np.empty(shape=(args.num_samples, args.num_repetitions), dtype=object)
-    max_length = max(all_lengths)
+        sample_print_template, row_print_template, all_print_template, \
+        sample_file_template, row_file_template, all_file_template = construct_template_variables(args.unconstrained)
+        max_vis_samples = 6
+        num_vis_samples = min(args.num_samples, max_vis_samples)
+        animations = np.empty(shape=(args.num_samples, args.num_repetitions), dtype=object)
+        max_length = max(all_lengths)
 
-    for sample_i in range(args.num_samples):
-        rep_files = []
-        for rep_i in range(args.num_repetitions):
-            caption = all_text[rep_i*args.batch_size + sample_i]
-            if args.dynamic_text_path != '':  # caption per frame
-                assert type(caption) == list
-                caption_per_frame = []
-                for c in caption:
-                    caption_per_frame += [c] * args.pred_len
-                caption = caption_per_frame
+        for sample_i in range(args.num_samples):
+            rep_files = []
+            for rep_i in range(args.num_repetitions):
+                caption = all_text[rep_i*args.batch_size + sample_i]
+                if args.dynamic_text_path != '':  # caption per frame
+                    assert type(caption) == list
+                    caption_per_frame = []
+                    for c in caption:
+                        caption_per_frame += [c] * args.pred_len
+                    caption = caption_per_frame
 
-            
-            # Trim / freeze motion if needed
-            length = all_lengths[rep_i*args.batch_size + sample_i]
-            motion = all_motions[rep_i*args.batch_size + sample_i].transpose(2, 0, 1)[:max_length]
-            if motion.shape[0] > length:
-                motion[length:-1] = motion[length-1]  # duplicate the last frame to end of motion, so all motions will be in equal length
+                
+                # Trim / freeze motion if needed
+                length = all_lengths[rep_i*args.batch_size + sample_i]
+                motion = all_motions[rep_i*args.batch_size + sample_i].transpose(2, 0, 1)[:max_length]
+                if motion.shape[0] > length:
+                    motion[length:-1] = motion[length-1]  # duplicate the last frame to end of motion, so all motions will be in equal length
 
-            save_file = sample_file_template.format(sample_i, rep_i)
-            animation_save_path = os.path.join(out_path, save_file)
-            gt_frames = np.arange(args.context_len) if args.context_len > 0 and not args.autoregressive else []
-            animations[sample_i, rep_i] = plot_3d_motion(animation_save_path, 
-                                                         skeleton, motion, dataset=args.dataset, title=caption, 
-                                                         fps=fps, gt_frames=gt_frames)
-            rep_files.append(animation_save_path)
+                save_file = sample_file_template.format(sample_i, rep_i)
+                animation_save_path = os.path.join(out_path, save_file)
+                gt_frames = np.arange(args.context_len) if args.context_len > 0 and not args.autoregressive else []
+                print(f"  [{time.time() - overall_start_time:.2f}s] Plotting 3D motion for sample {sample_i}, rep {rep_i} to {animation_save_path}...")
+                plot_3d_start_time = time.time()
+                animations[sample_i, rep_i] = plot_3d_motion(animation_save_path, 
+                                                             skeleton, motion, dataset=args.dataset, title=caption, 
+                                                             fps=fps, gt_frames=gt_frames)
+                print(f"  [{time.time() - overall_start_time:.2f}s] Plotting 3D motion finished (took {time.time() - plot_3d_start_time:.2f}s).")
+                rep_files.append(animation_save_path)
 
-    save_multiple_samples(out_path, {'all': all_file_template}, animations, fps, max(list(all_lengths) + [n_frames]))
+        print(f"[{time.time() - overall_start_time:.2f}s] Saving multiple samples video...")
+        save_multi_start_time = time.time()
+        save_multiple_samples(out_path, {'all': all_file_template}, animations, fps, max(list(all_lengths) + [n_frames]))
+        print(f"[{time.time() - overall_start_time:.2f}s] Multiple samples video saved (took {time.time() - save_multi_start_time:.2f}s).")
+        print(f"[{time.time() - overall_start_time:.2f}s] All visualizations saved (total visual. took {time.time() - vis_overall_start_time:.2f}s).")
+    else:
+        print(f"[{time.time() - overall_start_time:.2f}s] Skipping video visualization as per no_video=True.")
 
     abs_path = os.path.abspath(out_path)
-    print(f'[Done] Results are at [{abs_path}]')
+    print(f"[{time.time() - overall_start_time:.2f}s] [Done] Results are at [{abs_path}]")
+    print(f"Total time for MDM generate.py main: {time.time() - overall_start_time:.2f}s")
 
     return out_path
 
@@ -257,6 +297,13 @@ def save_multiple_samples(out_path, file_templates,  animations, fps, max_frames
     num_samples_in_out_file = 3
     n_samples = animations.shape[0]
     
+    try:
+        # Attempt to use a reference from the caller if set (not standard but for this specific edit)
+        if not hasattr(save_multiple_samples, 'overall_start_time_ref'):
+            save_multiple_samples.overall_start_time_ref = time.time() # Fallback if not set by caller
+    except NameError: # Fallback if main isn't in scope in a way that allows this hack
+        save_multiple_samples.overall_start_time_ref = time.time()
+
     for sample_i in range(0,n_samples,num_samples_in_out_file):
         last_sample_i = min(sample_i+num_samples_in_out_file, n_samples)
         all_sample_save_file = file_templates['all'].format(sample_i, last_sample_i-1)
@@ -271,7 +318,10 @@ def save_multiple_samples(out_path, file_templates,  animations, fps, max_frames
         
         # import time
         # start = time.time()
+        print(f"    [{time.time() - save_multiple_samples.overall_start_time_ref:.2f}s] Writing video file {all_sample_save_path}...")
+        video_write_start_time = time.time()
         clips.write_videofile(all_sample_save_path, fps=fps, threads=4, logger=None)
+        print(f"    [{time.time() - save_multiple_samples.overall_start_time_ref:.2f}s] Video file {all_sample_save_path} written (took {time.time() - video_write_start_time:.2f}s).")
         # print(f'duration = {time.time()-start}')
         
         for clip in clips.clips: 
@@ -315,4 +365,6 @@ def is_substr_in_list(substr, list_of_strs):
     return np.char.find(list_of_strs, substr) != -1  # [substr in string for string in list_of_strs]
 
 if __name__ == "__main__":
+    main_start_time = time.time()
     main()
+    print(f"generate.py script finished. Total execution time: {time.time() - main_start_time:.2f}s")
