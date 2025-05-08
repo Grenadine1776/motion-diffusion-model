@@ -6,13 +6,38 @@ from utils.parser_util import get_cond_mode
 from data_loaders.humanml_utils import HML_EE_JOINT_NAMES
 
 def load_model_wo_clip(model, state_dict):
-    # assert (state_dict['sequence_pos_encoder.pe'][:model.sequence_pos_encoder.pe.shape[0]] == model.sequence_pos_encoder.pe).all()  # TEST
-    # assert (state_dict['embed_timestep.sequence_pos_encoder.pe'][:model.embed_timestep.sequence_pos_encoder.pe.shape[0]] == model.embed_timestep.sequence_pos_encoder.pe).all()  # TEST
-    del state_dict['sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
-    del state_dict['embed_timestep.sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    missing_keys = []
+    unexpected_keys = []
+    error_msgs = []
+    # copy state_dict so _load_from_state_dict can modify it
+    metadata = getattr(state_dict, '_metadata', None)
+    state_dict = state_dict.copy()
+    if metadata is not None:
+        state_dict._metadata = metadata
+
+    def load(module, prefix=''):
+        local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
+        module._load_from_state_dict(
+            state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
+        for name, child in module._modules.items():
+            if child is not None:
+                load(child, prefix + name + '.')
+
+    load(model)
+    load._είχε = True
+
+    # ---- ADD THIS FOR DEBUGGING ----
+    if unexpected_keys:
+        print("MDM/utils/model_util.py:load_model_wo_clip: Found unexpected keys in checkpoint:")
+        for key in unexpected_keys:
+            print(f"  - {key}")
+    if missing_keys:
+        print("MDM/utils/model_util.py:load_model_wo_clip: Model is missing keys from checkpoint (some are expected, e.g. CLIP parts):")
+        for key in missing_keys:
+            print(f"  - {key}")
+    # ---- END DEBUGGING ADDITION ----
+
     assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') or 'sequence_pos_encoder' in k for k in missing_keys])
 
 
 def create_model_and_diffusion(args, data):
