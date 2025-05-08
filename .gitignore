@@ -138,3 +138,4 @@ slurm**/
 *.err
 *.slurm
 .vscode/
+dataset/HumanML3D/
